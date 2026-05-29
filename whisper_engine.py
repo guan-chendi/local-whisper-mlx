@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import subprocess
 import threading
@@ -141,6 +142,72 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}h{m:02d}m{s:02d}s"
 
 
+def _parse_ts(ts: str) -> float:
+    """Parse mlx-whisper's "HH:MM:SS.mmm" or "MM:SS.mmm" timestamp into seconds."""
+    parts = ts.strip().split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+    except ValueError:
+        pass
+    return 0.0
+
+
+class _SegmentProgress:
+    """File-like object that captures mlx-whisper's verbose stdout and turns
+    every "[start --> end] text" line into a log line of our own."""
+
+    def __init__(self, total_duration: float):
+        self._buf = ""
+        self._count = 0
+        self._total = max(total_duration, 0.01)
+        self._t_first: float | None = None
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        self._buf += s
+        while "\n" in self._buf:
+            line, _, rest = self._buf.partition("\n")
+            self._buf = rest
+            self._emit(line)
+        return len(s)
+
+    def flush(self) -> None:
+        if self._buf.strip():
+            self._emit(self._buf)
+            self._buf = ""
+
+    def _emit(self, raw: str) -> None:
+        line = raw.strip()
+        if not line.startswith("["):
+            return  # mlx-whisper occasionally prints non-segment lines (lang detect, etc.) — drop
+        try:
+            close = line.index("]")
+        except ValueError:
+            return
+        self._count += 1
+        if self._t_first is None:
+            self._t_first = time.monotonic()
+        ts = line[1:close]
+        text = line[close + 1:].strip()
+        end_str = ts.split("-->")[-1].strip()
+        end_secs = _parse_ts(end_str)
+        pct = min(100.0, (end_secs / self._total) * 100.0)
+        # ETA: extrapolate from elapsed-since-first-segment + processed audio fraction.
+        eta_str = ""
+        if end_secs > 0 and self._t_first is not None:
+            elapsed = time.monotonic() - self._t_first
+            if elapsed > 0.5 and pct > 0:
+                total_est = elapsed * (100.0 / pct)
+                eta = max(0.0, total_est - elapsed)
+                eta_str = f", eta {_fmt_duration(eta)}"
+        preview = text[:60] + ("…" if len(text) > 60 else "")
+        log.info("  seg %4d (%3.0f%% @ %s%s): %s", self._count, pct, end_str, eta_str, preview)
+
+
 # ---------------------------------------------------------------------------
 # Batch transcription
 # ---------------------------------------------------------------------------
@@ -176,15 +243,20 @@ def transcribe_file(
         "path_or_hf_repo": local_model,
         "task": task,
         "word_timestamps": word_timestamps,
-        "verbose": None,  # suppress mlx-whisper's stdout chatter
+        # verbose=True makes mlx-whisper print each segment to stdout as it's
+        # decoded; we redirect stdout below and re-emit each line through our
+        # logger so the user sees progress in the same stream as everything else.
+        "verbose": True,
     }
     if language:
         kwargs["language"] = language
 
     log.info("transcribing %s of audio with %s ...", _fmt_duration(duration), model_id)
     t0 = time.monotonic()
-    with _inference_lock:
+    progress = _SegmentProgress(duration)
+    with _inference_lock, contextlib.redirect_stdout(progress):
         result = mlx_whisper.transcribe(audio, **kwargs)
+    progress.flush()
     elapsed = time.monotonic() - t0
     rt = (duration / elapsed) if elapsed > 0 else 0.0
     n_seg = len(result.get("segments", []))
