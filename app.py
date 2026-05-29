@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from whisper_engine import (
     MODELS,
     SAMPLE_RATE,
     StreamingSession,
+    ensure_model,
     session_tick_async,
     transcribe_file_async,
 )
@@ -58,6 +60,8 @@ async def transcribe(
 
     suffix = Path(file.filename).suffix or ".bin"
     tmp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+    t_request = time.monotonic()
+    log.info("=== batch request: %s (model=%s, lang=%s) ===", file.filename, model, language or "auto")
 
     try:
         with tmp_path.open("wb") as f:
@@ -66,8 +70,8 @@ async def transcribe(
                 if not chunk:
                     break
                 f.write(chunk)
+        log.info("upload received: %s (%.1f MB)", file.filename, tmp_path.stat().st_size / (1 << 20))
 
-        log.info("Transcribing %s (model=%s, lang=%s)", file.filename, model, language or "auto")
         result = await transcribe_file_async(
             tmp_path,
             model_id=model,
@@ -75,6 +79,7 @@ async def transcribe(
             task=task,
         )
         result["filename"] = file.filename
+        log.info("=== batch done: %s in %.2fs total ===", file.filename, time.monotonic() - t_request)
         return JSONResponse(result)
     except Exception as e:
         log.exception("Batch transcription failed")
@@ -183,14 +188,18 @@ async def ws_stream(ws: WebSocket) -> None:
                 kind = data.get("type")
                 if kind == "start":
                     if session is None:
+                        model_id = data.get("model") or DEFAULT_MODEL
+                        log.info("=== stream request (model=%s, lang=%s) ===", model_id, data.get("language") or "auto")
+                        # Pre-resolve the model so the first tick isn't blocked on a download.
+                        await asyncio.to_thread(ensure_model, model_id)
                         session = StreamingSession(
-                            model_id=data.get("model") or DEFAULT_MODEL,
+                            model_id=model_id,
                             language=data.get("language") or None,
                             task=data.get("task") or "transcribe",
                         )
                         ticker_task = asyncio.create_task(ticker())
                         await ws.send_text(json.dumps({"type": "ready"}))
-                        log.info("Stream started (model=%s)", session.model_id)
+                        log.info("stream ready; listening")
                 elif kind == "stop":
                     break
 
@@ -226,7 +235,7 @@ async def ws_stream(ws: WebSocket) -> None:
             await ws.close()
         except Exception:
             pass
-        log.info("Stream ended")
+        log.info("=== stream ended ===")
 
 
 # ---------------------------------------------------------------------------

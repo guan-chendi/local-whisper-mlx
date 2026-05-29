@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 import threading
 import time
@@ -14,10 +15,13 @@ import numpy as np
 
 # Use the bundled static ffmpeg so the user doesn't need brew install.
 import imageio_ffmpeg
+from huggingface_hub import snapshot_download
 
 FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe()
 
 import mlx_whisper  # noqa: E402
+
+log = logging.getLogger("local-whisper.engine")
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +80,14 @@ def load_audio(src_path: str | Path) -> np.ndarray:
     We run our bundled ffmpeg directly so mlx-whisper never has to shell out
     to a `ffmpeg` binary on PATH (which may not exist on the user's system).
     """
+    src = Path(src_path)
+    is_video = src.suffix.lower() in VIDEO_EXTS
+    if is_video:
+        log.info("extracting audio from video: %s", src.name)
+    else:
+        log.info("decoding audio: %s", src.name)
+
+    t0 = time.monotonic()
     cmd = [
         FFMPEG_BIN,
         "-nostdin",
@@ -92,7 +104,41 @@ def load_audio(src_path: str | Path) -> np.ndarray:
         err = result.stderr.decode("utf-8", errors="replace")[-800:]
         raise RuntimeError(f"ffmpeg failed: {err}")
     pcm = np.frombuffer(result.stdout, dtype=np.int16)
-    return (pcm.astype(np.float32) / 32768.0).copy()
+    audio = (pcm.astype(np.float32) / 32768.0).copy()
+    duration = len(audio) / SAMPLE_RATE
+    verb = "extracted" if is_video else "decoded"
+    log.info("audio %s: %s of audio in %.2fs", verb, _fmt_duration(duration), time.monotonic() - t0)
+    return audio
+
+
+def ensure_model(model_id: str) -> str:
+    """Make sure the model weights are on disk; return the local snapshot path.
+
+    First tries a cache-only lookup. If that fails, downloads the repo. Either
+    way the path returned can be passed to mlx_whisper.transcribe(path_or_hf_repo=...)
+    so it never re-resolves the repo over the network.
+    """
+    try:
+        path = snapshot_download(model_id, local_files_only=True)
+        log.info("model cached: %s", model_id)
+        return path
+    except Exception:
+        pass  # not cached -> real download below
+    log.info("downloading model: %s (first use; this may take a while)", model_id)
+    t0 = time.monotonic()
+    path = snapshot_download(model_id)
+    log.info("model downloaded: %s in %.1fs", model_id, time.monotonic() - t0)
+    return path
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +166,14 @@ def transcribe_file(
     # Decode to a numpy array ourselves — handles audio and video uniformly,
     # and avoids mlx-whisper's internal `ffmpeg` PATH lookup.
     audio = load_audio(src)
+    duration = len(audio) / SAMPLE_RATE
+
+    # Make sure the model is on disk (logs cached vs. downloading) and pass the
+    # local path so mlx-whisper doesn't redo any HF lookup.
+    local_model = ensure_model(model_id)
 
     kwargs: dict[str, Any] = {
-        "path_or_hf_repo": model_id,
+        "path_or_hf_repo": local_model,
         "task": task,
         "word_timestamps": word_timestamps,
         "verbose": None,  # suppress mlx-whisper's stdout chatter
@@ -130,8 +181,17 @@ def transcribe_file(
     if language:
         kwargs["language"] = language
 
+    log.info("transcribing %s of audio with %s ...", _fmt_duration(duration), model_id)
+    t0 = time.monotonic()
     with _inference_lock:
         result = mlx_whisper.transcribe(audio, **kwargs)
+    elapsed = time.monotonic() - t0
+    rt = (duration / elapsed) if elapsed > 0 else 0.0
+    n_seg = len(result.get("segments", []))
+    log.info(
+        "transcribed: %d segments in %.2fs (%.1f× realtime, lang=%s)",
+        n_seg, elapsed, rt, result.get("language") or "?",
+    )
 
     # Normalize the segments to a JSON-friendly shape.
     segments = [
