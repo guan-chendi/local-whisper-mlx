@@ -112,6 +112,39 @@ def load_audio(src_path: str | Path) -> np.ndarray:
     return audio
 
 
+def is_video(src_path: str | Path) -> bool:
+    """True if the file's extension marks it as a video container."""
+    return Path(src_path).suffix.lower() in VIDEO_EXTS
+
+
+def extract_audio(src_path: str | Path, out_path: str | Path) -> Path:
+    """Extract the audio track of a media file into a standalone .mp3.
+
+    Uses the bundled ffmpeg, so no system install is required. Returns the
+    written output path.
+    """
+    src, out = Path(src_path), Path(out_path)
+    log.info("extracting audio track: %s -> %s", src.name, out.name)
+    t0 = time.monotonic()
+    cmd = [
+        FFMPEG_BIN,
+        "-nostdin",
+        "-y",
+        "-threads", "0",
+        "-i", str(src),
+        "-vn",                  # drop any video stream
+        "-acodec", "libmp3lame",
+        "-q:a", "2",            # VBR ~190 kbps
+        str(out),
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode != 0:
+        err = result.stderr.decode("utf-8", errors="replace")[-800:]
+        raise RuntimeError(f"ffmpeg failed: {err}")
+    log.info("audio extracted: %s in %.2fs", out.name, time.monotonic() - t0)
+    return out
+
+
 def ensure_model(model_id: str) -> str:
     """Make sure the model weights are on disk; return the local snapshot path.
 

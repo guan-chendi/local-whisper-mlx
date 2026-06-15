@@ -131,6 +131,20 @@ a:hover { text-decoration: underline; }
 .status.hidden { display: none; }
 .status.error { border-color: var(--danger); color: var(--danger); }
 
+.batch-actions { margin-top: 12px; }
+.batch-actions.hidden { display: none; }
+.audio-btn {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.audio-btn:hover:not(:disabled) { background: var(--panel-2); border-color: var(--accent); }
+.audio-btn:disabled { opacity: 0.6; cursor: progress; }
+
 .progress-bar {
   height: 4px;
   background: var(--border);

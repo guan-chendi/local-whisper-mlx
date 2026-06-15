@@ -15,6 +15,7 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
 from whisper_engine import (
     DEFAULT_MODEL,
@@ -22,6 +23,8 @@ from whisper_engine import (
     SAMPLE_RATE,
     StreamingSession,
     ensure_model,
+    extract_audio,
+    is_video,
     session_tick_async,
     transcribe_file_async,
 )
@@ -86,6 +89,50 @@ async def transcribe(
         raise HTTPException(500, str(e))
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+@app.post("/api/extract-audio")
+async def extract_audio_endpoint(file: UploadFile = File(...)) -> FileResponse:
+    """Extract the audio track from an uploaded video and return it as .mp3."""
+    if not file.filename:
+        raise HTTPException(400, "Missing filename")
+    if not is_video(file.filename):
+        raise HTTPException(400, "Audio extraction is only available for video files")
+
+    suffix = Path(file.filename).suffix or ".bin"
+    token = uuid.uuid4().hex
+    src_path = UPLOAD_DIR / f"{token}{suffix}"
+    out_path = UPLOAD_DIR / f"{token}.mp3"
+    log.info("=== extract-audio request: %s ===", file.filename)
+
+    try:
+        with src_path.open("wb") as f:
+            while True:
+                chunk = await file.read(1 << 20)  # 1 MB
+                if not chunk:
+                    break
+                f.write(chunk)
+        await asyncio.to_thread(extract_audio, src_path, out_path)
+    except Exception as e:
+        src_path.unlink(missing_ok=True)
+        out_path.unlink(missing_ok=True)
+        log.exception("Audio extraction failed")
+        raise HTTPException(500, str(e))
+    finally:
+        # The source video is no longer needed once extraction has run (or failed).
+        src_path.unlink(missing_ok=True)
+
+    download_name = f"{Path(file.filename).stem}.mp3"
+
+    def _cleanup() -> None:
+        out_path.unlink(missing_ok=True)
+
+    return FileResponse(
+        str(out_path),
+        media_type="audio/mpeg",
+        filename=download_name,
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.post("/api/export/{fmt}")

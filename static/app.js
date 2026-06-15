@@ -8,6 +8,8 @@ const state = {
   // Last completed transcript (for export).
   text: "",
   segments: [],          // [{start, end, text}]
+  // Last uploaded video file, kept so its audio can be extracted on demand.
+  videoFile: null,
   // Live streaming
   committed: "",
   partial: "",
@@ -28,7 +30,16 @@ document.addEventListener("DOMContentLoaded", async () => {
   initDropzone();
   initMic();
   initTranscriptControls();
+  initAudioDownload();
 });
+
+// True when the file is a video container we can extract audio from.
+function isVideoFile(file) {
+  if (file.type && file.type.startsWith("video/")) return true;
+  const m = /\.([a-z0-9]+)$/i.exec(file.name);
+  const ext = m ? m[1].toLowerCase() : "";
+  return ["mp4", "mov", "mkv", "webm", "avi", "m4v", "flv", "wmv", "mpeg", "mpg"].includes(ext);
+}
 
 // ---------------------------------------------------------------------------
 // Tabs
@@ -123,6 +134,10 @@ async function handleFile(file) {
     return;
   }
   showBatchStatus(`Transcribing ${file.name} …`, "progress");
+
+  // Offer audio extraction whenever the source is a video.
+  state.videoFile = isVideoFile(file) ? file : null;
+  showAudioDownload(!!state.videoFile);
 
   const opts = getOpts();
   const form = new FormData();
@@ -446,6 +461,8 @@ function initTranscriptControls() {
         state.segments = [];
         state.committed = "";
         state.partial = "";
+        state.videoFile = null;
+        showAudioDownload(false);
         renderSegments();
         enableExports(false);
         return;
@@ -475,6 +492,42 @@ function initTranscriptControls() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Audio extraction (video → mp3)
+// ---------------------------------------------------------------------------
+
+function showAudioDownload(visible) {
+  document.getElementById("batch-actions").classList.toggle("hidden", !visible);
+}
+
+function initAudioDownload() {
+  const btn = document.getElementById("download-audio-btn");
+  btn.addEventListener("click", async () => {
+    const file = state.videoFile;
+    if (!file) return;
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Extracting audio …";
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch("/api/extract-audio", { method: "POST", body: form });
+      if (!res.ok) throw new Error((await res.text()) || `${res.status} ${res.statusText}`);
+      const blob = await res.blob();
+      const name = file.name.replace(/\.[^.]+$/, "") + ".mp3";
+      downloadBlob(name, blob);
+      btn.textContent = "Saved ✓";
+      setTimeout(() => (btn.textContent = orig), 1500);
+    } catch (e) {
+      console.error(e);
+      btn.textContent = "Failed";
+      setTimeout(() => (btn.textContent = orig), 1500);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
 function enableExports(enabled) {
   document.querySelectorAll(".export-btn").forEach((b) => {
     if (b.id === "clear-btn") return;
@@ -483,7 +536,10 @@ function enableExports(enabled) {
 }
 
 function downloadFile(name, body) {
-  const blob = new Blob([body], { type: "text/plain;charset=utf-8" });
+  downloadBlob(name, new Blob([body], { type: "text/plain;charset=utf-8" }));
+}
+
+function downloadBlob(name, blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = name;
